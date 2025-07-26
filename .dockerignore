@@ -1,0 +1,27 @@
+.codeium/
+# Development caches and IDE config
+.cache
+.idea
+.vscode*
+
+# Large toolchains and vendor directories not needed in image
+go
+.nv
+vendor
+node_modules
+unsloth_compiled_cache
+
+# VCS
+.git
+
+# Large artifacts and data files
+*.tar.gz
+*.zip
+*.whl
+*.pt
+# *.onnx (allow ONNX models in build context)
+*.csv
+*.parquet
+
+# Python bytecode
+**/__pycache__/
