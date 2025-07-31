@@ -7,111 +7,119 @@ import (
     "log"
     "net/http"
     "os"
-    "os/exec"
+    "bytes"
     "sync"
     "time"
-
+    
     "github.com/prometheus/client_golang/prometheus"
     "github.com/prometheus/client_golang/prometheus/promhttp"
-)
-   
-   type PredictionResponse struct {
-    PredictedLabel string  `json:"predicted_label"`
-    Confidence     float64 `json:"confidence"`
-   }
-   
-   type PredictionRequest struct {
-    ImageURL string `json:"image_url"`
-   }
-
-// simple in-memory cache for prediction results
-var (
-    cache   = make(map[string][]byte)
-    cacheMu sync.RWMutex
-
-    // paths to currently active ONNX model and labels file
-    currentModelPath  = "efficientnet-lite4-11-int8.onnx"
-    currentLabelsPath = ""
-
-    requestCount = prometheus.NewCounterVec(
-        prometheus.CounterOpts{
-            Name: "http_requests_total",
-            Help: "Total number of HTTP requests",
-        }, []string{"path", "method", "status"},
     )
-    requestDuration = prometheus.NewHistogramVec(
-        prometheus.HistogramOpts{
-            Name:    "http_request_duration_seconds",
-            Help:    "Duration of HTTP requests in seconds",
-            Buckets: prometheus.DefBuckets,
-        }, []string{"path"},
+    
+    type PredictionResponse struct {
+    	PredictedLabel string  `json:"predicted_label"`
+    	Confidence     float64 `json:"confidence"`
+    }
+    
+    type PredictionRequest struct {
+    	ImageURL string `json:"image_url"`
+    }
+    
+    var (
+    	cache   = make(map[string][]byte)
+    	cacheMu sync.RWMutex
+    
+    	currentModelPath  = "efficientnet-lite4-11-int8.onnx"
+    	currentLabelsPath = ""
+    
+    	requestCount = prometheus.NewCounterVec(
+    		prometheus.CounterOpts{
+    			Name: "http_requests_total",
+    			Help: "Total number of HTTP requests",
+    		}, []string{"path", "method", "status"},
+    	)
+    	requestDuration = prometheus.NewHistogramVec(
+    		prometheus.HistogramOpts{
+    			Name:    "http_request_duration_seconds",
+    			Help:    "Duration of HTTP requests in seconds",
+    			Buckets: prometheus.DefBuckets,
+    		}, []string{"path"},
+    	)
     )
-)
+    
+    func init() {
+    	prometheus.MustRegister(requestCount, requestDuration)
+    }
+    
+    func trainHandler(w http.ResponseWriter, r *http.Request) {
+    	if r.Method != http.MethodPost {
+    		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+    		return
+    	}
+    
+    	body, err := io.ReadAll(r.Body)
+    	if err != nil {
+    		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+    		return
+    	}
+    	r.Body.Close() 
+    
+    	var req PredictionRequest
+    	if err := json.Unmarshal(body, &req); err != nil {
+    		http.Error(w, "Invalid request body", http.StatusBadRequest)
+    		return
+    	}
+    
+    	if req.ImageURL == "" {
+    		http.Error(w, "image_url is required", http.StatusBadRequest)
+    		return
+    	}
+    
+    	cacheMu.RLock()
+    	if data, ok := cache[req.ImageURL]; ok {
+    		cacheMu.RUnlock()
+    		w.Header().Set("Content-Type", "application/json")
+    		w.Write(data)
+    		return
+    	}
+    	cacheMu.RUnlock()
+    
+    	pyReqBody, err := json.Marshal(req)
+    	if err != nil {
+    		http.Error(w, "Failed to create request body for Python service", http.StatusInternalServerError)
+    		return
+    	}
+    
+    	pythonServiceURL := os.Getenv("PYTHON_SERVICE_URL")
+    	if pythonServiceURL == "" {
+    		pythonServiceURL = "http://127.0.0.1:8000" // Default for local development
+    	}
+    
+    	resp, err := http.Post(pythonServiceURL+"/train", "application/json", bytes.NewBuffer(pyReqBody))
+    	if err != nil {
+    		http.Error(w, "Failed to call Python service", http.StatusInternalServerError)
+    		return
+    	}
+    	defer resp.Body.Close()
+    
+    	pyRespBody, err := io.ReadAll(resp.Body)
+    	if err != nil {
+    		http.Error(w, "Failed to read response from Python service", http.StatusInternalServerError)
+    		return
+    	}
+    
+    	if resp.StatusCode != http.StatusOK {
+    		http.Error(w, fmt.Sprintf("Python service returned an error: %s", string(pyRespBody)), resp.StatusCode)
+    		return
+    	}
+    
+    	cacheMu.Lock()
+    	cache[req.ImageURL] = pyRespBody
+    	cacheMu.Unlock()
+    
+    	w.Header().Set("Content-Type", "application/json")
+    	w.Write(pyRespBody)
+    }
 
-func init() {
-    prometheus.MustRegister(requestCount, requestDuration)
-}
-   
-    func predictHandler(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPost {
-            http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
-            return
-        }
-
-        // Read the body into a byte slice so it can be read multiple times.
-        body, err := io.ReadAll(r.Body)
-        if err != nil {
-            http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-            return
-        }
-        r.Body.Close() // Close the original body
-
-        // Use the buffered body for all subsequent operations.
-        var req PredictionRequest
-        if err := json.Unmarshal(body, &req); err != nil {
-            http.Error(w, "Invalid request body", http.StatusBadRequest)
-            return
-        }
-
-        if req.ImageURL == "" {
-            http.Error(w, "image_url is required", http.StatusBadRequest)
-            return
-        }
-
-        // Check cache first
-        cacheMu.RLock()
-        if data, ok := cache[req.ImageURL]; ok {
-            cacheMu.RUnlock()
-            w.Header().Set("Content-Type", "application/json")
-            w.Write(data)
-            return
-        }
-        cacheMu.RUnlock()
-
-                // Build command args dynamically based on uploaded model/labels
-        args := []string{"train.py", req.ImageURL, currentModelPath}
-        if currentLabelsPath != "" {
-            args = append(args, currentLabelsPath)
-        }
-        cmd := exec.Command("python3", args...)
-        output, err := cmd.CombinedOutput()
-        if err != nil {
-            log.Printf("Error executing command: %v", err)
-            log.Printf("Output: %s", string(output))
-            http.Error(w, fmt.Sprintf("Error executing script: %s", output), http.StatusInternalServerError)
-            return
-        }
-
-        // cache the response
-        cacheMu.Lock()
-        cache[req.ImageURL] = output
-        cacheMu.Unlock()
-
-        w.Header().Set("Content-Type", "application/json")
-        w.Write(output)
-}
-
-// logMiddleware logs incoming HTTP requests with method, path, status code and duration, and records Prometheus metrics.
 func logMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         start := time.Now()
@@ -160,13 +168,11 @@ func corsMiddleware(next http.Handler) http.Handler {
         return
     }
 
-    // Parse multipart form with a reasonable default limit (e.g., 100MB)
     if err := r.ParseMultipartForm(100 << 20); err != nil {
         http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
         return
     }
 
-    // Model file
     modelFile, modelHeader, err := r.FormFile("model")
     if err != nil {
         http.Error(w, "model file is required: "+err.Error(), http.StatusBadRequest)
@@ -186,7 +192,6 @@ func corsMiddleware(next http.Handler) http.Handler {
     }
     out.Close()
 
-    // Optional labels
     labelsFile, labelsHeader, err := r.FormFile("labels")
     labelsPath := ""
     if err == nil {
@@ -205,11 +210,9 @@ func corsMiddleware(next http.Handler) http.Handler {
         lout.Close()
     }
 
-    // Update global paths atomically
     cacheMu.Lock()
     currentModelPath = modelPath
     currentLabelsPath = labelsPath
-    // Clear cache as predictions may differ with new model
     cache = make(map[string][]byte)
     cacheMu.Unlock()
 
@@ -224,8 +227,8 @@ func main() {
     mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
     mux.Handle("/metrics", promhttp.Handler())
         mux.HandleFunc("/upload", uploadHandler)
-    mux.HandleFunc("/predict", predictHandler)
-   
+    mux.HandleFunc("/train", trainHandler)
+
     port := os.Getenv("PORT")
     if port == "" {
         port = "8080"

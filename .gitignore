@@ -11,3 +11,4 @@ windsurf-server
 go1.22.0.linux-amd64.tar.gz
 .wget-hsts
 .windsurf-server
+.gemini/
